@@ -8388,7 +8388,6 @@ class ServerImpl extends TcpDiscoveryImpl {
             }
         }
 
-
         /**
          * @param laps Number of discovery ring laps passed by the message.
          * @param msg Message taken from the queue.
