@@ -16,9 +16,11 @@
 
 package org.apache.ignite.internal.processors.query.h2;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.ignite.cache.query.exceptions.SqlMemoryQuotaExceededException;
 import org.apache.ignite.internal.processors.query.GridQueryMemoryMetricProvider;
 import org.apache.ignite.internal.util.tostring.GridToStringExclude;
@@ -30,9 +32,8 @@ import org.apache.ignite.internal.util.typedef.internal.S;
  * Track query memory usage and throws an exception if query tries to allocate memory over limit.
  */
 public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetricProvider {
-    /** State updater. */
-    private static final AtomicIntegerFieldUpdater<QueryMemoryTracker> STATE_UPDATER
-        = AtomicIntegerFieldUpdater.newUpdater(QueryMemoryTracker.class, "state");
+    /** Tracker was closed exception. */
+    private static final TrackerWasClosedException TRACKER_WAS_CLOSED_EXCEPTION = new TrackerWasClosedException("Memory tracker has been closed concurrently.");
 
     /** Tracker is not closed and not in the middle of the closing process. */
     private static final int STATE_INITIAL = 0;
@@ -60,22 +61,22 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
     private final long blockSize;
 
     /** Memory reserved on parent. */
-    private long reservedFromParent;
+    private final AtomicLong reservedFromParent = new AtomicLong();
 
     /** Memory reserved by query. */
-    private volatile long reserved;
+    private final AtomicLong reserved = new AtomicLong();
 
     /** Maximum number of bytes reserved by query. */
-    private volatile long maxReserved;
+    private final AtomicLong maxReserved = new AtomicLong();
 
     /** Number of bytes written on disk at the current moment. */
-    private volatile long writtenOnDisk;
+    private final AtomicLong writtenOnDisk = new AtomicLong();
 
     /** Maximum number of bytes written on disk at the same time. */
-    private volatile long maxWrittenOnDisk;
+    private final AtomicLong maxWrittenOnDisk = new AtomicLong();
 
     /** Total number of bytes written on disk tracked by current tracker. */
-    private volatile long totalWrittenOnDisk;
+    private final AtomicLong totalWrittenOnDisk = new AtomicLong();
 
     /** Close flag to prevent tracker reuse. */
     private volatile boolean closed;
@@ -84,10 +85,13 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
     private volatile int state;
 
     /** Children. */
-    private final List<H2MemoryTracker> children = new ArrayList<>();
+    private final Queue<H2MemoryTracker> children = new LinkedBlockingQueue<>();
 
     /** The number of files created by the query. */
-    private volatile int filesCreated;
+    private final AtomicInteger filesCreated = new AtomicInteger();
+
+    /** Lock object. */
+    private final Object lock = new Object();
 
     /**
      * Constructor.
@@ -112,31 +116,30 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
     }
 
     /** {@inheritDoc} */
-    @Override public synchronized boolean reserve(long size) {
+    @Override public boolean reserve(long size) {
         assert size >= 0;
 
-        checkClosed();
+        if (closed)
+            throw TRACKER_WAS_CLOSED_EXCEPTION;
 
-        reserved += size;
-        maxReserved = Math.max(maxReserved, reserved);
+        final long reserved0 = reserved.addAndGet(size);
 
-        if (parent != null && reserved > reservedFromParent) {
-            if (!reserveFromParent())
-                return false; // Offloading.
+        if (size == 0)
+            return quota == 0 || reserved0 < quota;
+
+        if (quota > 0 && reserved0 >= quota) {
+            onQuotaExceeded();
+
+            if (reserved0 > reservedFromParent.get() && parent != null)
+                reserveFromParent();
+
+            return false;
         }
 
-        if (quota > 0 && reserved >= quota)
-            return onQuotaExceeded();
+        if (reserved0 > reservedFromParent.get() && parent != null)
+            return reserveFromParent();
 
         return true;
-    }
-
-    /**
-     * Checks whether tracker was closed.
-     */
-    private void checkClosed() {
-        if (closed)
-            throw new TrackerWasClosedException("Memory tracker has been closed concurrently.");
     }
 
     /**
@@ -144,19 +147,24 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
      * @return {@code false} if offloading is needed.
      */
     private boolean reserveFromParent() {
-        // If single block size is too small.
-        long blockSize = Math.max(reserved - reservedFromParent, this.blockSize);
+        synchronized (lock) {
+            if (closed)
+                throw TRACKER_WAS_CLOSED_EXCEPTION;
 
-        // If we are too close to limit.
-        if (quota > 0)
-            blockSize = Math.min(blockSize, quota - reservedFromParent);
+            // If single block size is too small.
+            long reservationSize = Math.max(reserved.get() - reservedFromParent.get(), blockSize);
 
-        if (parent.reserve(blockSize))
-            reservedFromParent += blockSize;
-        else
-            return false;
+            // If we are too close to limit.
+            if (quota > 0)
+                reservationSize = Math.min(reservationSize, quota - reservedFromParent.get());
 
-        return true;
+            if (parent.reserve(reservationSize))
+                reservedFromParent.addAndGet(reservationSize);
+            else
+                return false;
+
+            return true;
+        }
     }
 
     /**
@@ -171,20 +179,23 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
     }
 
     /** {@inheritDoc} */
-    @Override public synchronized void release(long size) {
+    @Override public void release(long size) {
         assert size >= 0;
 
-        if (size == 0)
+        if (closed)
+            throw TRACKER_WAS_CLOSED_EXCEPTION;
+
+        if (size == 0 || state == STATE_CLOSED)
             return;
 
-        checkClosed();
+        final long reserved0 = reserved.addAndGet(-size);
 
-        reserved -= size;
+        maxReserved.set(Math.max(maxReserved.get(), reserved0 + size));
 
-        assert reserved >= 0 : "Try to free more memory that ever be reserved: [reserved=" + (reserved + size) +
+        assert reserved0 >= 0 : "Try to free more memory that ever be reserved: [reserved=" + (reserved0 + size) +
             ", toFree=" + size + ']';
 
-        if (parent != null && reservedFromParent - reserved > blockSize)
+        if (reservedFromParent.get() - reserved0 > blockSize && parent != null)
             releaseFromParent();
     }
 
@@ -192,38 +203,46 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
      * Releases memory from parent.
      */
     private void releaseFromParent() {
-        long toReleaseFromParent = reservedFromParent - reserved;
+        synchronized (lock) {
+            if (closed)
+                throw TRACKER_WAS_CLOSED_EXCEPTION;
 
-        parent.release(toReleaseFromParent);
+            long toReleaseFromParent = reservedFromParent.get() - reserved.get();
 
-        reservedFromParent -= toReleaseFromParent;
+            if (toReleaseFromParent < blockSize)
+                return;
 
-        assert reservedFromParent >= 0 : reservedFromParent;
+            parent.release(toReleaseFromParent);
+
+            final long reservedFromParent0 = reservedFromParent.addAndGet(-toReleaseFromParent);
+
+            assert reservedFromParent0 >= 0 : reservedFromParent;
+        }
     }
 
     /** {@inheritDoc} */
     @Override public long reserved() {
-        return reserved;
+        return reserved.get();
     }
 
     /** {@inheritDoc} */
     @Override public long maxReserved() {
-        return maxReserved;
+        return Math.max(maxReserved.get(), reserved.get());
     }
 
     /** {@inheritDoc} */
     @Override public long writtenOnDisk() {
-        return writtenOnDisk;
+        return writtenOnDisk.get();
     }
 
     /** {@inheritDoc} */
     @Override public long maxWrittenOnDisk() {
-        return maxWrittenOnDisk;
+        return Math.max(maxWrittenOnDisk.get(), writtenOnDisk.get());
     }
 
     /** {@inheritDoc} */
     @Override public long totalWrittenOnDisk() {
-        return totalWrittenOnDisk;
+        return totalWrittenOnDisk.get();
     }
 
     /**
@@ -234,35 +253,38 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
     }
 
     /** {@inheritDoc} */
-    @Override public synchronized void spill(long size) {
+    @Override public void spill(long size) {
         assert size >= 0;
+
+        if (closed)
+            throw TRACKER_WAS_CLOSED_EXCEPTION;
 
         if (size == 0)
             return;
 
-        checkClosed();
-
         if (parent != null)
             parent.spill(size);
 
-        writtenOnDisk += size;
-        totalWrittenOnDisk += size;
-        maxWrittenOnDisk = Math.max(maxWrittenOnDisk, writtenOnDisk);
+        writtenOnDisk.addAndGet(size);
+        totalWrittenOnDisk.addAndGet(size);
     }
 
     /** {@inheritDoc} */
     @Override public synchronized void unspill(long size) {
         assert size >= 0;
 
+        if (closed)
+            throw TRACKER_WAS_CLOSED_EXCEPTION;
+
         if (size == 0)
             return;
-
-        checkClosed();
 
         if (parent != null)
             parent.unspill(size);
 
-        writtenOnDisk -= size;
+        long writtenOnDisk0 = writtenOnDisk.getAndAdd(-size);
+
+        maxWrittenOnDisk.set(Math.max(maxWrittenOnDisk.get(), writtenOnDisk0));
     }
 
     /**
@@ -274,49 +296,61 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
 
     /** {@inheritDoc} */
     @Override public void close() {
-        // It is not expected to be called concurrently with reserve\release.
-        // But query can be cancelled concurrently on query finish.
-        if (!STATE_UPDATER.compareAndSet(this, STATE_INITIAL, STATE_CLOSED))
+        if (state == STATE_CLOSED)
             return;
 
-        synchronized (this) {
-            for (H2MemoryTracker child : children)
-                child.close();
+        synchronized (lock) {
+            // It is not expected to be called concurrently with reserve\release.
+            // But query can be cancelled concurrently on query finish.
+            if (state == STATE_CLOSED)
+                return;
 
-            children.clear();
+            state = STATE_CLOSED;
+
+            children.forEach(H2MemoryTracker::close);
+
+            closed = true;
+            reserved.set(0);
+            writtenOnDisk.set(0);
+
+            if (parent != null)
+                parent.release(reservedFromParent.get());
+
+            reservedFromParent.set(0);
         }
-
-        closed = true;
-
-        reserved = 0;
-
-        if (parent != null)
-            parent.release(reservedFromParent);
     }
 
     /** {@inheritDoc} */
-    @Override public synchronized void incrementFilesCreated() {
+    @Override public void incrementFilesCreated() {
+        if (closed)
+            throw TRACKER_WAS_CLOSED_EXCEPTION;
+
         if (parent != null)
             parent.incrementFilesCreated();
 
-        filesCreated++;
+        filesCreated.incrementAndGet();
     }
 
     /** {@inheritDoc} */
-    @Override public synchronized H2MemoryTracker createChildTracker() {
-        checkClosed();
+    @Override public H2MemoryTracker createChildTracker() {
+        if (state == STATE_CLOSED)
+            throw TRACKER_WAS_CLOSED_EXCEPTION;
 
         H2MemoryTracker child = new ChildMemoryTracker(this);
 
         children.add(child);
 
+        if (state == STATE_CLOSED)
+            throw TRACKER_WAS_CLOSED_EXCEPTION;
+
         return child;
     }
 
-    /** {@inheritDoc} */
-    @Override public synchronized void onChildClosed(H2MemoryTracker child) {
-        if (state != STATE_CLOSED)
-            children.remove(child);
+    /**
+     * @return Count of created files.
+     */
+    public int filesCreated() {
+        return filesCreated.get();
     }
 
     /** {@inheritDoc} */
@@ -354,7 +388,8 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
 
         /** {@inheritDoc} */
         @Override public boolean reserve(long size) {
-            checkClosed();
+            if (state == STATE_CLOSED)
+                throw TRACKER_WAS_CLOSED_EXCEPTION;
 
             boolean res;
             try {
@@ -369,7 +404,8 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
 
         /** {@inheritDoc} */
         @Override public void release(long size) {
-            checkClosed();
+            if (state == STATE_CLOSED)
+                throw TRACKER_WAS_CLOSED_EXCEPTION;
 
             reserved -= size;
 
@@ -393,7 +429,8 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
 
         /** {@inheritDoc} */
         @Override public void spill(long size) {
-            checkClosed();
+            if (state == STATE_CLOSED)
+                throw TRACKER_WAS_CLOSED_EXCEPTION;
 
             parent.spill(size);
 
@@ -403,7 +440,8 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
 
         /** {@inheritDoc} */
         @Override public void unspill(long size) {
-            checkClosed();
+            if (state == STATE_CLOSED)
+                throw TRACKER_WAS_CLOSED_EXCEPTION;
 
             parent.unspill(size);
 
@@ -412,21 +450,18 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
 
         /** {@inheritDoc} */
         @Override public void incrementFilesCreated() {
-            checkClosed();
+            if (state == STATE_CLOSED)
+                throw TRACKER_WAS_CLOSED_EXCEPTION;
 
             parent.incrementFilesCreated();
         }
 
         /** {@inheritDoc} */
         @Override public H2MemoryTracker createChildTracker() {
-            checkClosed();
+            if (state == STATE_CLOSED)
+                throw TRACKER_WAS_CLOSED_EXCEPTION;
 
             return parent.createChildTracker();
-        }
-
-        /** {@inheritDoc} */
-        @Override public void onChildClosed(H2MemoryTracker child) {
-            parent.onChildClosed(child);
         }
 
         /** {@inheritDoc} */
@@ -444,14 +479,6 @@ public class QueryMemoryTracker implements H2MemoryTracker, GridQueryMemoryMetri
 
             reserved = 0;
             writtenOnDisk = 0;
-
-            parent.onChildClosed(this);
-        }
-
-        /** */
-        private void checkClosed() {
-            if (state == STATE_CLOSED)
-                throw new TrackerWasClosedException("Memory tracker has been closed concurrently.");
         }
     }
 

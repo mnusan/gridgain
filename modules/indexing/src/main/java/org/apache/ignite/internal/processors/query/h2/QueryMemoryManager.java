@@ -352,11 +352,6 @@ public class QueryMemoryManager implements H2MemoryTracker, ManagedGroupByDataFa
     }
 
     /** {@inheritDoc} */
-    @Override public void onChildClosed(H2MemoryTracker child) {
-        throw new UnsupportedOperationException();
-    }
-
-    /** {@inheritDoc} */
     @Override public boolean closed() {
         throw new UnsupportedOperationException();
     }
